@@ -8,6 +8,7 @@ import com.gameops.craft.repo.RevokeRepository;
 import com.gameops.craft.service.CraftService;
 import com.gameops.craft.service.CraftTxService;
 import com.gameops.craft.service.RecipeAdminService;
+import com.gameops.craft.service.RecallService;
 import com.gameops.craft.domain.ItemQty;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -33,17 +34,19 @@ public class OperatorController {
 
     private final RecipeAdminService recipeAdmin;
     private final CraftTxService craftTx;
+    private final RecallService recall;
     private final InventoryRepository inventory;
     private final OrderRepository orders;
     private final LedgerRepository ledger;
     private final RevokeRepository revokes;
     private final Clock clock;
 
-    public OperatorController(RecipeAdminService recipeAdmin, CraftTxService craftTx,
+    public OperatorController(RecipeAdminService recipeAdmin, CraftTxService craftTx, RecallService recall,
                               InventoryRepository inventory, OrderRepository orders,
                               LedgerRepository ledger, RevokeRepository revokes, Clock clock) {
         this.recipeAdmin = recipeAdmin;
         this.craftTx = craftTx;
+        this.recall = recall;
         this.inventory = inventory;
         this.orders = orders;
         this.ledger = ledger;
@@ -58,6 +61,8 @@ public class OperatorController {
     public record CloseRecipeRequest(@NotNull Long recipeId, String reason) {}
     public record RevokeRequest(@NotBlank String orderNo) {}
     public record GrantRequest(@NotNull Long playerId, @NotBlank String itemCode, @PositiveOrZero long qty) {}
+    public record RecallRequest(@NotNull Long versionId, String reason) {}
+    public record RecallRetryRequest(@NotBlank String batchNo, @NotBlank String orderNo) {}
 
     // ---- recipe lifecycle --------------------------------------------------
 
@@ -162,6 +167,79 @@ public class OperatorController {
             m.put("createdAt", r.createdAt());
             return m;
         }).toList();
+    }
+
+    // ---- emergency recall batches -----------------------------------------
+
+    /** Initiate an emergency recall for a published version; blocks new preoccupies at once. */
+    @PostMapping("/recalls")
+    public Map<String, Object> initiateRecall(@Valid @RequestBody RecallRequest req,
+                                              HttpServletRequest request,
+                                              @org.springframework.web.bind.annotation.RequestHeader(
+                                                      value = "Idempotency-Key", required = false)
+                                                      String idempotencyKey) {
+        String key = idempotencyKey;
+        if (key == null || key.isBlank()) {
+            throw com.gameops.craft.common.ApiException.badRequest("IDEMPOTENCY_KEY_REQUIRED",
+                    "召回必须携带 Idempotency-Key");
+        }
+        RecallService.InitiateResult r =
+                recall.initiate(req.versionId(), key, req.reason(), CurrentUsers.from(request).userId());
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("batchNo", r.batchNo());
+        body.put("created", r.created());
+        body.put("totalOrders", r.totalOrders());
+        body.put("status", r.status());
+        body.put("replayed", !r.created());
+        // The batch processes asynchronously (scheduled processor); also return its live report.
+        body.put("batch", recall.batchReport(r.batchNo()));
+        return body;
+    }
+
+    /** Manually drive a batch (idempotent continuation; safe to call repeatedly). */
+    @PostMapping("/recalls/{batchNo}/run")
+    public Map<String, Object> runRecall(@PathVariable String batchNo) {
+        RecallService.RunSummary s = recall.runBatch(batchNo);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("batchNo", s.batchNo());
+        body.put("status", s.status());
+        body.put("totalOrders", s.total());
+        body.put("processedOrders", s.processed());
+        body.put("released", s.released());
+        body.put("reversed", s.reversed());
+        body.put("skipped", s.skipped());
+        body.put("exception", s.exception());
+        return body;
+    }
+
+    /** Retry one parked order after replenishing the missing output. */
+    @PostMapping("/recalls/retry")
+    public Map<String, Object> retryRecallOrder(@Valid @RequestBody RecallRetryRequest req,
+                                                HttpServletRequest request) {
+        return recall.retryOrder(req.batchNo(), req.orderNo(), CurrentUsers.from(request).userId());
+    }
+
+    @GetMapping("/recalls")
+    public List<Map<String, Object>> listRecalls() {
+        return recall.listBatches();
+    }
+
+    @GetMapping("/recalls/{batchNo}")
+    public Map<String, Object> recallDetail(@PathVariable String batchNo) {
+        return recall.batchReport(batchNo);
+    }
+
+    @GetMapping("/recalls/{batchNo}/orders/{orderNo}/events")
+    public List<Map<String, Object>> recallOrderEvents(@PathVariable String batchNo,
+                                                       @PathVariable String orderNo) {
+        return recall.orderEvents(batchNo, orderNo);
+    }
+
+    /** Retryable recall exceptions across batches (or one batch when batchNo is given). */
+    @GetMapping("/recall-exceptions")
+    public List<Map<String, Object>> recallExceptions(
+            @RequestParam(required = false) String batchNo) {
+        return recall.listExceptions(batchNo);
     }
 
     /** Test/ops helper to set up player balances; writes an auditable GRANT ledger line. */

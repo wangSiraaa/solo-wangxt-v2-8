@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS recipe_version (
     craft_timeout_s INT          NOT NULL COMMENT 'seconds to finish before holds auto-release',
     published_at    DATETIME(3)  NULL,
     published_by    BIGINT       NULL,
+    recalled        TINYINT(1)   NOT NULL DEFAULT 0 COMMENT '版本已被紧急召回，禁止新预占',
+    recalled_at     DATETIME(3)  NULL,
+    recall_batch_no CHAR(20)     NULL,
     created_at      DATETIME(3) NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_recipe_version (recipe_id, version_no),
@@ -76,12 +79,14 @@ CREATE TABLE IF NOT EXISTS craft_order (
     player_id           BIGINT       NOT NULL,
     recipe_id           BIGINT       NOT NULL,
     recipe_version_id   BIGINT       NOT NULL COMMENT 'snapshot: order always finishes on this version',
-    status              VARCHAR(16)  NOT NULL COMMENT 'PREOCCUPIED / COMMITTED / CANCELLED / TIMEOUT / REVOKED',
+    status              VARCHAR(16)  NOT NULL COMMENT 'PREOCCUPIED / COMMITTED / CANCELLED / TIMEOUT / REVOKED / RECALLED / RECALL_EXCEPTION',
     status_reason       VARCHAR(255) NULL,
     preoccupy_deadline  DATETIME(3)  NOT NULL COMMENT 'holds released by sweeper after this time',
     committed_at        DATETIME(3)  NULL,
     closed_at           DATETIME(3)  NULL,
     revoke_ref_no       CHAR(20)     NULL COMMENT 'set when order is revoked',
+    recall_batch_no     CHAR(20)     NULL COMMENT 'set when order is covered by a recall batch',
+    recall_settled_at   DATETIME(3)  NULL,
     created_at          DATETIME(3) NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uk_order_no (order_no),
@@ -112,7 +117,7 @@ CREATE TABLE IF NOT EXISTS ledger_entry (
     player_id     BIGINT       NOT NULL,
     item_code     VARCHAR(64)  NOT NULL,
     entry_type    VARCHAR(24)  NOT NULL
-                  COMMENT 'CONSUME / PRODUCE / RELEASE / GRANT / REVOKE / REVOKE_PENDING',
+                  COMMENT 'CONSUME / PRODUCE / RELEASE / GRANT / REVOKE / REVOKE_PENDING / RECALL_CLAWBACK / RECALL_RETURN / RECALL_PENDING',
     qty_delta     BIGINT       NOT NULL COMMENT 'signed; +credit, -debit',
     related_ref   CHAR(20)     NULL COMMENT 'original order_no for a REVOKE reversal row',
     status        VARCHAR(16)  NOT NULL DEFAULT 'POSTED' COMMENT 'POSTED / PENDING',
@@ -153,4 +158,70 @@ CREATE TABLE IF NOT EXISTS revoke_record (
     UNIQUE KEY uk_revoke_order (order_id),
     UNIQUE KEY uk_revoke_no (revoke_no),
     KEY ix_revoke_result (result)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================================
+-- 版本紧急召回与清算批次
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS recall_batch (
+    id                BIGINT       NOT NULL AUTO_INCREMENT,
+    batch_no          CHAR(20)     NOT NULL,
+    idempotency_key   VARCHAR(80)  NOT NULL,
+    recipe_id         BIGINT       NOT NULL,
+    recipe_version_id BIGINT       NOT NULL,
+    version_no        INT          NOT NULL,
+    cutoff_at         DATETIME(3)  NOT NULL COMMENT '受影响范围固化时刻（含此刻之前下单）',
+    status            VARCHAR(24)  NOT NULL COMMENT 'PENDING / COMPLETED / PARTIAL_EXCEPTION',
+    reason            VARCHAR(255) NULL,
+    operator_id       BIGINT       NOT NULL,
+    total_orders      INT          NOT NULL DEFAULT 0,
+    processed_orders  INT          NOT NULL DEFAULT 0,
+    result_released   INT          NOT NULL DEFAULT 0,
+    result_reversed   INT          NOT NULL DEFAULT 0,
+    result_skipped    INT          NOT NULL DEFAULT 0,
+    result_exception  INT          NOT NULL DEFAULT 0,
+    created_at        DATETIME(3)  NOT NULL,
+    started_at        DATETIME(3)  NULL,
+    finished_at       DATETIME(3)  NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_recall_batch_no (batch_no),
+    UNIQUE KEY uk_recall_batch_key (idempotency_key),
+    UNIQUE KEY uk_recall_batch_version (recipe_version_id),
+    KEY ix_recall_batch_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS recall_batch_order (
+    id              BIGINT       NOT NULL AUTO_INCREMENT,
+    batch_id        BIGINT       NOT NULL,
+    batch_no        CHAR(20)     NOT NULL,
+    order_id        BIGINT       NOT NULL,
+    order_no        CHAR(20)     NOT NULL,
+    player_id       BIGINT       NOT NULL,
+    snapshot_status VARCHAR(16)  NOT NULL COMMENT '快照时订单状态，仅记录不改写',
+    status          VARCHAR(16)  NOT NULL COMMENT 'PENDING / DONE',
+    result          VARCHAR(24)  NULL COMMENT 'RELEASED / REVERSED / SKIPPED / EXCEPTION',
+    detail_json     TEXT         NULL COMMENT '逐单原因（跳过原因/产出缺口）',
+    attempts        INT          NOT NULL DEFAULT 0,
+    settled_at      DATETIME(3)  NULL,
+    created_at      DATETIME(3)  NOT NULL,
+    updated_at      DATETIME(3)  NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uk_recall_order (batch_id, order_id),
+    KEY ix_recall_order_status (batch_id, status),
+    KEY ix_recall_order_result (batch_id, result)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS recall_batch_event (
+    id          BIGINT       NOT NULL AUTO_INCREMENT,
+    batch_no    CHAR(20)     NOT NULL,
+    order_id    BIGINT       NOT NULL,
+    order_no    CHAR(20)     NOT NULL,
+    event_type  VARCHAR(24)  NOT NULL COMMENT 'ATTEMPT / SETTLED / RETRY',
+    from_status VARCHAR(16)  NULL,
+    to_status   VARCHAR(16)  NULL,
+    result      VARCHAR(24)  NULL,
+    message     VARCHAR(500) NULL,
+    created_at  DATETIME(3)  NOT NULL,
+    PRIMARY KEY (id),
+    KEY ix_recall_event_order (batch_no, order_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

@@ -24,7 +24,7 @@ public class OrderRepository {
             SELECT o.id, o.order_no, o.player_id, o.recipe_id, o.recipe_version_id,
                    rv.version_no, r.code AS recipe_code, r.name AS recipe_name,
                    o.status, o.status_reason, o.preoccupy_deadline, o.committed_at,
-                   o.closed_at, o.revoke_ref_no, o.created_at
+                   o.closed_at, o.revoke_ref_no, o.recall_batch_no, o.recall_settled_at, o.created_at
               FROM craft_order o
               JOIN recipe r ON r.id = o.recipe_id
               JOIN recipe_version rv ON rv.id = o.recipe_version_id
@@ -37,6 +37,7 @@ public class OrderRepository {
         Timestamp committed = rs.getTimestamp("committed_at");
         Timestamp closed = rs.getTimestamp("closed_at");
         Timestamp created = rs.getTimestamp("created_at");
+        Timestamp recallSettled = rs.getTimestamp("recall_settled_at");
         return new CraftOrder(
                 rs.getLong("id"), rs.getString("order_no"), rs.getLong("player_id"),
                 rs.getLong("recipe_id"), rs.getLong("recipe_version_id"),
@@ -46,6 +47,8 @@ public class OrderRepository {
                 committed == null ? null : committed.toInstant(),
                 closed == null ? null : closed.toInstant(),
                 rs.getString("revoke_ref_no"),
+                rs.getString("recall_batch_no"),
+                recallSettled == null ? null : recallSettled.toInstant(),
                 created == null ? null : created.toInstant());
     }
 
@@ -111,6 +114,57 @@ public class OrderRepository {
                 """, revokeNo, Timestamp.from(now), orderId);
     }
 
+    /** Recall of a still-open order: release materials and close it as RECALLED. */
+    public int casRecallRelease(long orderId, String batchNo, String reason, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'RECALLED', status_reason = ?, closed_at = ?,
+                       recall_batch_no = ?, recall_settled_at = ?
+                 WHERE id = ? AND status = 'PREOCCUPIED'
+                """, reason, Timestamp.from(now), batchNo, Timestamp.from(now), orderId);
+    }
+
+    /** Recall liquidation of a committed order: outputs clawed back + inputs returned. */
+    public int casRecallReverse(long orderId, String batchNo, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'RECALLED', closed_at = ?,
+                       recall_batch_no = ?, recall_settled_at = ?
+                 WHERE id = ? AND status = 'COMMITTED'
+                """, Timestamp.from(now), batchNo, Timestamp.from(now), orderId);
+    }
+
+    /**
+     * Committed order whose outputs are partly gone: parked, not partially liquidated.
+     * REVOKED etc. never match, so operator revoke and recall cannot both land.
+     */
+    public int casRecallException(long orderId, String batchNo, String reason, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'RECALL_EXCEPTION', status_reason = ?,
+                       recall_batch_no = ?, recall_settled_at = ?
+                 WHERE id = ? AND status = 'COMMITTED'
+                """, reason, batchNo, Timestamp.from(now), orderId);
+    }
+
+    /** A parked exception order becomes a settled recall once stock is replenished. */
+    public int casRecallExceptionToReversed(long orderId, String reason, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET status = 'RECALLED', status_reason = ?, closed_at = ?, recall_settled_at = ?
+                 WHERE id = ? AND status = 'RECALL_EXCEPTION'
+                """, reason, Timestamp.from(now), Timestamp.from(now), orderId);
+    }
+
+    /** Stamp the recall batch on orders that are already terminal (history preserved). */
+    public int markRecallBatchOnly(long orderId, String batchNo, Instant now) {
+        return jdbc.update("""
+                UPDATE craft_order
+                   SET recall_batch_no = ?, recall_settled_at = ?
+                 WHERE id = ? AND recall_batch_no IS NULL
+                """, batchNo, Timestamp.from(now), orderId);
+    }
+
     public List<CraftOrder> listByPlayer(long playerId, int limit) {
         return jdbc.query(SELECT_COLS + " WHERE o.player_id = ? ORDER BY o.id DESC LIMIT ?",
                 MAPPER, playerId, limit);
@@ -130,5 +184,34 @@ public class OrderRepository {
 
     public List<CraftOrder> listRecent(int limit) {
         return jdbc.query(SELECT_COLS + " ORDER BY o.id DESC LIMIT ?", MAPPER, limit);
+    }
+
+    /**
+     * Freeze the affected scope of a recall: every order bound to the version that
+     * existed at the cutoff instant (created_at <= cutoff). Locked FOR UPDATE so a
+     * concurrent commit/cancel/timeout on one of these orders is serialised against
+     * the batch creation, and a brand-new preoccupy racing the recall flag cannot
+     * slip in past the cutoff (it locks the version row first).
+     */
+    public List<CraftOrder> lockOrdersForRecall(long versionId, Instant cutoff) {
+        return jdbc.query("""
+                SELECT o.*, rv.version_no AS version_no, r.code AS recipe_code, r.name AS recipe_name
+                  FROM craft_order o
+                  JOIN recipe r ON r.id = o.recipe_id
+                  JOIN recipe_version rv ON rv.id = o.recipe_version_id
+                 WHERE o.recipe_version_id = ? AND o.created_at <= ?
+                 ORDER BY o.id
+                 FOR UPDATE
+                """, (rs, n) -> map(rs), versionId, Timestamp.from(cutoff));
+    }
+
+    public Optional<CraftOrder> findByIdForUpdate(long orderId) {
+        return jdbc.query("""
+                SELECT o.*, rv.version_no AS version_no, r.code AS recipe_code, r.name AS recipe_name
+                  FROM craft_order o
+                  JOIN recipe r ON r.id = o.recipe_id
+                  JOIN recipe_version rv ON rv.id = o.recipe_version_id
+                 WHERE o.id = ? FOR UPDATE
+                """, (rs, n) -> map(rs), orderId).stream().findFirst();
     }
 }

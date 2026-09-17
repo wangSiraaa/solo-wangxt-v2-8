@@ -6,6 +6,7 @@
       <button :class="tab==='recipes' ? '' : 'secondary'" @click="tab='recipes'">配方版本</button>
       <button :class="tab==='ledger' ? '' : 'secondary'" @click="tab='ledger'; loadOpsData()">账本监控</button>
       <button :class="tab==='revoke' ? '' : 'secondary'" @click="tab='revoke'; loadRevokes()">撤销与异常清单</button>
+      <button :class="tab==='recall' ? '' : 'secondary'" @click="tab='recall'; loadRecalls()">版本紧急召回</button>
       <button :class="tab==='grant' ? '' : 'secondary'" @click="tab='grant'">库存工具</button>
     </div>
 
@@ -64,7 +65,9 @@
             <td class="right">
               <button v-if="v.status==='DRAFT'" class="secondary" @click="edit(r, v)">编辑草稿</button>
               <button v-if="v.status==='DRAFT'" @click="publish(r, v)">发布</button>
-              <span v-else class="muted small">已发布版本不可改，只能新建版本</span>
+              <button v-else-if="!v.recalled" class="danger" @click="startRecall(r, v)">紧急召回</button>
+              <span v-else class="tag bad">已召回 {{ v.recallBatchNo }}</span>
+              <span v-if="v.status==='DRAFT'" class="muted small">已发布版本不可改，只能新建版本</span>
             </td>
           </tr>
           </tbody>
@@ -202,6 +205,111 @@
       </div>
     </div>
 
+    <!-- ===================== 版本紧急召回 ===================== -->
+    <div v-if="tab==='recall'">
+      <div class="panel">
+        <h2>发起版本紧急召回</h2>
+        <p class="muted small">
+          召回立即阻止该版本产生<strong>新预占</strong>，并按“召回版本 + 截止时刻”固化受影响订单范围：
+          预占中释放原材料；已完成单在产出仍足够时<strong>一次性收回全部产出并返还原始材料</strong>（成对补偿流水）；
+          任一产出已被使用则不做部分清算，整单进入<strong>待处理异常</strong>可补足后重试；
+          已取消/超时/已撤销单只记录判定、不改写历史。同一幂等键或重复发起只返回原批次。
+        </p>
+        <div class="row">
+          <input v-model.number="recallVersionId" type="number" placeholder="配方版本ID（recipe_version.id）" style="width:320px" />
+          <input v-model="recallReason" placeholder="召回原因（如：v2 产出数量配置错误）" style="width:340px" />
+          <button class="danger" @click="doStartRecall">发起召回（幂等）</button>
+          <button class="secondary" @click="loadRecalls">刷新</button>
+        </div>
+        <div v-if="recallFlash" class="flash" :class="recallFlash.type" style="margin-top:10px">{{ recallFlash.text }}</div>
+      </div>
+
+      <div v-for="b in recallBatches" :key="b.batchNo" class="panel">
+        <div class="row" style="justify-content:space-between">
+          <div>
+            <strong>批次 {{ b.batchNo }}</strong>
+            <span class="tag" :class="batchStatusClass(b.status)" style="margin-left:8px">{{ batchStatusText(b.status) }}</span>
+            <span class="muted small" style="margin-left:8px">版本 v{{ b.versionNo }}（id {{ b.versionId }}）</span>
+          </div>
+          <div class="row">
+            <button class="secondary" @click="openBatch(b.batchNo)">查看/刷新明细</button>
+            <button @click="runBatch(b.batchNo)">继续清算（幂等）</button>
+          </div>
+        </div>
+        <div class="row small muted" style="margin-top:6px">
+          <span>截止时刻：{{ fmt(b.cutoffAt) }}</span>
+          <span>创建：{{ fmt(b.createdAt) }}</span>
+          <span>完成：{{ fmt(b.finishedAt) }}</span>
+          <span>原因：{{ b.reason || '—' }}</span>
+        </div>
+        <div class="row" style="margin-top:8px;gap:8px">
+          <span class="tag">总数 {{ b.totalOrders }}</span>
+          <span class="tag">已处理 {{ b.processedOrders }}</span>
+          <span class="tag ok">释放预占 {{ b.resultReleased }}</span>
+          <span class="tag ok">清算返还 {{ b.resultReversed }}</span>
+          <span class="tag warn">仅记录 {{ b.resultSkipped }}</span>
+          <span class="tag bad">待处理异常 {{ b.resultException }}</span>
+        </div>
+
+        <div v-if="openDetail===b.batchNo" style="margin-top:12px">
+          <h3>逐单结果与原因</h3>
+          <table>
+            <thead>
+              <tr><th>合成单</th><th>玩家</th><th>快照状态</th><th>处理</th><th>结果</th><th>原因/明细</th><th>尝试</th><th></th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="o in (batchDetail && batchDetail.orders) || []" :key="o.orderNo">
+                <td class="mono small">{{ o.orderNo }}</td>
+                <td>#{{ o.playerId }}</td>
+                <td>{{ o.snapshotStatus }}</td>
+                <td>{{ o.status }}</td>
+                <td><span class="tag" :class="resultClass(o.result)">{{ resultText(o.result) }}</span></td>
+                <td class="small">
+                  <span class="muted">{{ o.detail && o.detail.reason }}</span>
+                  <span v-if="o.detail && o.detail.shortage" style="margin-left:6px">
+                    <span v-for="s in o.detail.shortage" :key="s.itemCode" class="tag bad" style="margin-right:4px">
+                      {{ s.itemCode }} 缺{{ s.short }}（存{{ s.have }}/需{{ s.need }}）
+                    </span>
+                  </span>
+                </td>
+                <td>{{ o.attempts }}</td>
+                <td>
+                  <button v-if="o.retryable" class="secondary" @click="retryOrder(b.batchNo, o.orderNo)">补足后重试</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>待处理异常（可重试） <span class="tag bad">{{ recallExceptions.length }}</span></h2>
+        <p class="muted small">
+          产出被玩家使用导致整单无法清算时进入此队列：先用“库存工具”补足缺口产出，再点对应批次的“重试”。
+          前次 PENDING 挂账记录保留可追溯。
+        </p>
+        <table>
+          <thead><tr><th>批次</th><th>版本</th><th>合成单</th><th>玩家</th><th>缺口</th><th>尝试</th><th></th></tr></thead>
+          <tbody>
+            <tr v-for="x in recallExceptions" :key="x.batchNo + x.orderNo">
+              <td class="mono small">{{ x.batchNo }}</td>
+              <td>v{{ x.versionNo }}</td>
+              <td class="mono small">{{ x.orderNo }}</td>
+              <td>#{{ x.playerId }}</td>
+              <td class="small">
+                <span v-for="s in (x.detail && x.detail.shortage) || []" :key="s.itemCode" class="tag bad" style="margin-right:4px">
+                  {{ s.itemCode }} 缺{{ s.short }}
+                </span>
+              </td>
+              <td>{{ x.attempts }}</td>
+              <td><button class="secondary" @click="retryOrder(x.batchNo, x.orderNo)">重试该单</button></td>
+            </tr>
+            <tr v-if="!recallExceptions.length"><td colspan="7" class="muted">暂无待处理异常</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- ===================== 库存工具 ===================== -->
     <div v-if="tab==='grant'">
       <div class="panel" style="max-width:560px">
@@ -256,7 +364,7 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { api } from '../api'
+import { api, idemKey } from '../api'
 import EntryType from '../components/EntryType.vue'
 
 const tab = ref('recipes')
@@ -277,6 +385,20 @@ const grantPlayerId = ref(2)
 const grantItemCode = ref('MAT_IRON')
 const grantQty = ref(10)
 const draft = ref(null)
+
+// ---- emergency recall ----
+const recallVersionId = ref(null)
+const recallReason = ref('')
+const recallBatches = ref([])
+const recallExceptions = ref([])
+const openDetail = ref(null)
+const batchDetail = ref(null)
+const recallFlash = ref(null)
+
+function recallNotify(type, text) {
+  recallFlash.value = { type, text }
+  setTimeout(() => (recallFlash.value = null), 8000)
+}
 
 const fmt = (t) => t ? new Date(t).toISOString().replace('T', ' ').slice(0, 19) : '—'
 function notify(type, text) { flash.value = { type, text }; setTimeout(() => flash.value = null, 6000) }
@@ -373,6 +495,77 @@ async function doGrant() {
     const r = await api.grant(grantPlayerId.value, grantItemCode.value.trim(), grantQty.value)
     notify('ok', `已写入，GRANT 流水号 ${r.refNo}`)
   } catch (e) { notify('error', e.message) }
+}
+
+// ---- emergency recall ----
+async function loadRecalls() {
+  recallBatches.value = await api.recallList()
+  recallExceptions.value = await api.recallExceptions()
+  if (openDetail.value) {
+    batchDetail.value = await api.recallDetail(openDetail.value)
+  }
+}
+
+function startRecall(recipe, v) {
+  recallVersionId.value = v.versionId
+  recallReason.value = `${recipe.code} v${v.versionNo} 配置错误召回`
+  tab.value = 'recall'
+  loadRecalls()
+}
+
+async function doStartRecall() {
+  if (!recallVersionId.value) { recallNotify('error', '请填写要召回的配方版本ID'); return }
+  try {
+    const r = await api.recallStart(recallVersionId.value, recallReason.value.trim(), idemKey())
+    recallNotify(r.replayed ? 'warn' : 'ok',
+      r.replayed
+        ? `该版本/幂等键已有召回批次：${r.batchNo}（返回原批次，未重复清算）`
+        : `已发起批次 ${r.batchNo}，固化 ${r.totalOrders} 张受影响订单，后台清算中…`)
+    // Settle immediately for small batches (per-order work is server-side transactional).
+    await api.recallRun(r.batchNo)
+    recallVersionId.value = null
+    recallReason.value = ''
+    await loadRecipes()
+    await loadRecalls()
+    openDetail.value = r.batchNo
+    batchDetail.value = await api.recallDetail(r.batchNo)
+  } catch (e) { recallNotify('error', `[${e.code}] ${e.message}`) }
+}
+
+async function runBatch(batchNo) {
+  try {
+    const s = await api.recallRun(batchNo)
+    recallNotify('ok', `批次 ${batchNo}：${s.status}，已处理 ${s.processedOrders}/${s.total}` +
+      `（释放 ${s.released} / 清算 ${s.reversed} / 仅记录 ${s.skipped} / 异常 ${s.exception}）`)
+    await loadRecalls()
+  } catch (e) { recallNotify('error', `[${e.code}] ${e.message}`) }
+}
+
+async function openBatch(batchNo) {
+  openDetail.value = batchNo
+  batchDetail.value = await api.recallDetail(batchNo)
+}
+
+async function retryOrder(batchNo, orderNo) {
+  try {
+    const r = await api.recallRetry(batchNo, orderNo)
+    recallNotify(r.result === 'REVERSED' ? 'ok' : 'error',
+      r.result === 'REVERSED' ? `${orderNo} 补足后重试成功，已清算返还。` : `${orderNo} 仍产出不足，保持待处理异常。`)
+    await loadRecalls()
+  } catch (e) { recallNotify('error', `[${e.code}] ${e.message}`) }
+}
+
+function batchStatusClass(s) {
+  return { COMPLETED: 'ok', PARTIAL_EXCEPTION: 'bad', PENDING: 'warn' }[s] || ''
+}
+function batchStatusText(s) {
+  return { COMPLETED: '已完成', PARTIAL_EXCEPTION: '部分待处理异常', PENDING: '清算中/待续跑' }[s] || s
+}
+function resultClass(r) {
+  return { RELEASED: 'ok', REVERSED: 'ok', SKIPPED: 'warn', EXCEPTION: 'bad' }[r] || ''
+}
+function resultText(r) {
+  return { RELEASED: '释放预占', REVERSED: '清算返还', SKIPPED: '仅记录', EXCEPTION: '待处理异常' }[r] || r
 }
 
 function versionClass(s) { return { PUBLISHED: 'ok', DRAFT: 'info', ARCHIVED: 'warn' }[s] || '' }

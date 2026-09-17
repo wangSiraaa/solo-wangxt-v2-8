@@ -149,6 +149,18 @@ public class CraftService {
             body.put("reason", "NO_PUBLISHED_VERSION");
             return body;
         }
+        if (current.recalled()) {
+            // Server-side recall flag: the console only displays the server's verdict.
+            body.put("versionNo", current.versionNo());
+            body.put("versionId", current.id());
+            body.put("recalled", true);
+            body.put("recallBatchNo", current.recallBatchNo());
+            body.put("craftable", false);
+            body.put("reason", "VERSION_RECALLED");
+            body.put("inputs", List.of());
+            body.put("outputs", current.outputs());
+            return body;
+        }
         List<ItemQty> inputs = current.inputs();
         Map<String, Long> balances = inventory.mapFor(playerId,
                 inputs.stream().map(ItemQty::getItemCode).toList());
@@ -203,6 +215,8 @@ public class CraftService {
             m.put("qty", h.qty());
             return m;
         }).toList());
+        // listByRef matches ref_no OR related_ref, so paired recall rows (related_ref=orderNo)
+        // appear in the player's full material trail alongside the original CONSUME/PRODUCE.
         body.put("ledger", ledger.listByRef(orderNo));
         return body;
     }
@@ -222,6 +236,9 @@ public class CraftService {
         m.put("committedAt", o.committedAt());
         m.put("closedAt", o.closedAt());
         m.put("revokeRefNo", o.revokeRefNo());
+        m.put("recallBatchNo", o.recallBatchNo());
+        m.put("recallSettledAt", o.recallSettledAt());
+        m.put("recalled", o.recallBatchNo() != null);
         m.put("createdAt", o.createdAt());
         return m;
     }

@@ -2,6 +2,9 @@
 -- schema-h2.sql on context start, here we only clear rows for a reseed.
 DELETE FROM idempotency_record;
 DELETE FROM revoke_record;
+DELETE FROM recall_batch_event;
+DELETE FROM recall_batch_order;
+DELETE FROM recall_batch;
 DELETE FROM ledger_entry;
 DELETE FROM material_hold;
 DELETE FROM craft_order;

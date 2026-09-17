@@ -24,13 +24,17 @@
               </div>
               <span class="tag" :class="recipeTagClass(r)">{{ recipeTagText(r) }}</span>
             </div>
-            <div class="muted small" style="margin:6px 0">
-              当前版本 v{{ r.versionNo ?? '—' }} ·
-              活动 {{ fmt(r.activityStart) }} ~ {{ fmt(r.activityEnd) }} ·
-              预占超时 {{ r.craftTimeoutSeconds ?? '—' }}s
-            </div>
+              <div class="muted small" style="margin:6px 0">
+                当前版本 v{{ r.versionNo ?? '—' }} ·
+                活动 {{ fmt(r.activityStart) }} ~ {{ fmt(r.activityEnd) }} ·
+                预占超时 {{ r.craftTimeoutSeconds ?? '—' }}s
+              </div>
 
-            <table v-if="r.inputs && r.inputs.length">
+              <div v-if="r.recalled" class="tag bad" style="display:inline-block;margin:4px 0">
+                ⚠️ 该版本已紧急召回（批次 {{ r.recallBatchNo }}），无法新发起合成；历史合成按下述清算结果处理。
+              </div>
+
+            <table v-if="!r.recalled && r.inputs && r.inputs.length">
               <thead><tr><th>材料</th><th class="right">需要</th><th class="right">持有</th><th class="right">其他单占用</th><th></th></tr></thead>
               <tbody>
                 <tr v-for="line in r.inputs" :key="line.itemCode">
@@ -46,12 +50,12 @@
                 </tr>
               </tbody>
             </table>
-            <div class="muted small" style="margin:6px 0">
+            <div v-if="!r.recalled" class="muted small" style="margin:6px 0">
               产出：<span v-for="o in r.outputs" :key="o.itemCode" class="mono tag" style="margin-right:6px">
                 {{ o.itemCode }} ×{{ o.qty }}
               </span>
             </div>
-            <div class="row">
+            <div class="row" v-if="!r.recalled">
               <button @click="preoccupy(r)" :disabled="busy">预占材料（第1步）</button>
               <span v-if="!r.craftable" class="small error">{{ cannotReason(r) }}</span>
             </div>
@@ -106,7 +110,7 @@
             <select v-model="selectedOrderNo" @change="loadDetail" style="width:240px">
               <option value="">选择合成单…</option>
               <option v-for="o in crafts" :key="o.orderNo" :value="o.orderNo">
-                {{ short(o.orderNo) }} · {{ o.recipeName }} · {{ o.status }}
+                {{ short(o.orderNo) }} · {{ o.recipeName }} · {{ statusText(o.status) }}
               </option>
             </select>
           </div>
@@ -114,8 +118,18 @@
             <div class="muted small" style="margin:8px 0">
               单号 <span class="mono">{{ detail.orderNo }}</span> ·
               绑定版本 v{{ detail.boundVersionNo }} · 状态
-              <span class="tag" :class="statusClass(detail.status)">{{ detail.status }}</span>
+              <span class="tag" :class="statusClass(detail.status)">{{ statusText(detail.status) }}</span>
               <span v-if="detail.revokeRefNo"> · 撤销单 <span class="mono">{{ short(detail.revokeRefNo) }}</span></span>
+              <span v-if="detail.recallBatchNo"> · 召回批次 <span class="mono">{{ short(detail.recallBatchNo) }}</span></span>
+            </div>
+            <div v-if="detail.recalled" class="tag" :class="detail.status==='RECALL_EXCEPTION' ? 'bad' : 'warn'"
+                 style="display:inline-block;margin-bottom:8px">
+              <template v-if="detail.status==='RECALLED'">
+                {{ recallSummary(detail) }}
+              </template>
+              <template v-else-if="detail.status==='RECALL_EXCEPTION'">
+                该单因版本召回待清算：部分产出已被使用，运营补足库存后将自动/手动重试，当前未改动材料。
+              </template>
             </div>
             <table>
               <thead><tr><th>时间(UTC)</th><th>流水类型</th><th>道具</th><th class="right">变动</th><th>说明</th></tr></thead>
@@ -259,7 +273,35 @@ function cannotReason(r) {
   return '材料不足（服务端会拒绝）'
 }
 function statusClass(s) {
-  return { COMMITTED: 'ok', PREOCCUPIED: 'info', CANCELLED: 'warn', TIMEOUT: 'warn', REVOKED: 'bad' }[s] || ''
+  return {
+    COMMITTED: 'ok', PREOCCUPIED: 'info', CANCELLED: 'warn', TIMEOUT: 'warn',
+    REVOKED: 'bad', RECALLED: 'warn', RECALL_EXCEPTION: 'bad'
+  }[s] || ''
+}
+function statusText(s) {
+  return {
+    COMMITTED: '已完成', PREOCCUPIED: '预占中', CANCELLED: '已取消', TIMEOUT: '已超时',
+    REVOKED: '已撤销', RECALLED: '已召回清算', RECALL_EXCEPTION: '召回待处理异常'
+  }[s] || s
+}
+/** Human-readable material disposition after recall, derived from the ledger trail. */
+function recallSummary(detail) {
+  const rows = detail.ledger || []
+  const released = rows.filter(e => e.entryType === 'RELEASE' && (e.remark || '').includes('召回'))
+  const clawed = rows.filter(e => e.entryType === 'RECALL_CLAWBACK')
+  const returned = rows.filter(e => e.entryType === 'RECALL_RETURN')
+  if (clawed.length) {
+    const sum = (rs) => rs.reduce((m, e) => (m[e.itemCode] = (m[e.itemCode] || 0) + Math.abs(e.qtyDelta), m), {})
+    const out = Object.entries(sum(clawed)).map(([k, v]) => `${k}×${v}`).join('，')
+    const back = Object.entries(sum(returned)).map(([k, v]) => `${k}×${v}`).join('，')
+    return `版本召回已一次性收回产出（${out}），并返还原始材料（${back}）。`
+  }
+  if (released.length) {
+    const sum = released.reduce((m, e) => (m[e.itemCode] = (m[e.itemCode] || 0) + e.qtyDelta, m), {})
+    const back = Object.entries(sum).map(([k, v]) => `${k}×${v}`).join('，')
+    return `版本召回：预占材料已全部释放回背包（${back}）。`
+  }
+  return '该订单在召回时已结束（取消/超时/已撤销），仅记录召回判定，历史材料去向不变。'
 }
 
 onMounted(async () => {

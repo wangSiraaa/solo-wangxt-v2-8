@@ -107,6 +107,15 @@ public class RecipeRepository {
                 recipeId, keepVersionId);
     }
 
+    /** Emergency recall flag: once set, the version can never produce new preoccupies. */
+    public int markRecalled(long versionId, String batchNo, Instant now) {
+        return jdbc.update("""
+                UPDATE recipe_version
+                   SET recalled = 1, recalled_at = ?, recall_batch_no = ?
+                 WHERE id = ? AND recalled = 0
+                """, Timestamp.from(now), batchNo, versionId);
+    }
+
     public Optional<RecipeVersion> findVersionById(long versionId) {
         return jdbc.query("SELECT * FROM recipe_version WHERE id = ?", VERSION_MAPPER, versionId)
                 .stream().findFirst();
@@ -152,6 +161,7 @@ public class RecipeRepository {
         Timestamp start = rs.getTimestamp("start_time");
         Timestamp end = rs.getTimestamp("end_time");
         Timestamp published = rs.getTimestamp("published_at");
+        Timestamp recalled = rs.getTimestamp("recalled_at");
         return new RecipeVersion(
                 rs.getLong("id"),
                 rs.getLong("recipe_id"),
@@ -162,6 +172,9 @@ public class RecipeRepository {
                 start == null ? null : start.toInstant(),
                 end == null ? null : end.toInstant(),
                 rs.getInt("craft_timeout_s"),
-                published == null ? null : published.toInstant());
+                published == null ? null : published.toInstant(),
+                rs.getInt("recalled") != 0,
+                recalled == null ? null : recalled.toInstant(),
+                rs.getString("recall_batch_no"));
     }
 }

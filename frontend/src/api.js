@@ -93,6 +93,18 @@ export const api = {
   revoke: (orderNo) => request('POST', '/api/operator/revokes', { orderNo }),
   revokes: (result) => request('GET', '/api/operator/revokes' + (result ? `?result=${result}` : '')),
   exceptions: () => request('GET', '/api/operator/exceptions'),
+
+  // emergency recall batches
+  recallStart: (versionId, reason, key) =>
+    request('POST', '/api/operator/recalls', { versionId, reason }, { 'Idempotency-Key': key }),
+  recallList: () => request('GET', '/api/operator/recalls'),
+  recallDetail: (batchNo) => request('GET', `/api/operator/recalls/${batchNo}`),
+  recallRun: (batchNo) => request('POST', `/api/operator/recalls/${batchNo}/run`),
+  recallRetry: (batchNo, orderNo) =>
+    request('POST', '/api/operator/recalls/retry', { batchNo, orderNo }),
+  recallExceptions: (batchNo) =>
+    request('GET', '/api/operator/recall-exceptions' + (batchNo ? `?batchNo=${encodeURIComponent(batchNo)}` : '')),
+
   grant: (playerId, itemCode, qty) =>
     request('POST', '/api/operator/inventory/grant', { playerId, itemCode, qty })
 }

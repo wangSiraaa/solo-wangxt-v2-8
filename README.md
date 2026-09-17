@@ -52,7 +52,8 @@ java -jar backend/target/craft-service-1.0.0.jar --spring.profiles.active=mysql
 ### 跑测试
 
 ```bash
-# 默认：H2 上 14 个用例（含“最后一份材料 2/8 并发”“提交与超时竞争”“幂等重试”等）
+# 默认：H2 上 23 个用例（含“最后一份材料 2/8 并发”“提交与超时竞争”“幂等重试”，
+# 以及召回混合状态清算、召回与完成并发唯一赢家、崩溃续跑/重复不双赔、产出不足补足重试等）
 cd backend && mvn test
 
 # 真实 InnoDB（需要本地 Docker，Testcontainers）：
@@ -86,13 +87,18 @@ bash scripts/smoke-e2e.sh
 | 超时取消释放占用 | 定时清扫器（默认 2s）对到期单用独立事务 CAS `PREOCCUPIED→TIMEOUT`；占用行 `released` 标记做 compare-and-set，**提交/取消/超时三路竞争至多一路释放**，并写 `RELEASE` 回补流水。 |
 | 规则不靠按钮 | 活动窗口、版本状态、材料余额全部在服务端事务内重算；前端只是回显服务端结论（如 `ACTIVITY_NOT_OPEN`、`MATERIAL_INSUFFICIENT`、`RECIPE_CLOSED`）。 |
 | 运营撤销错误奖励 | 仅对 `COMMITTED` 单：产出全在库→生成与原产出**相反的负向 `REVOKE` 流水**并扣回，`related_ref` 指向原单号；任一产出不足→**不做部分扣减**，整笔落 `revoke_record(result=EXCEPTION)` 并写 `REVOKE_PENDING(PENDING)` 挂账，进异常清单。重复撤销被 `COMMITTED→REVOKED` CAS 拒绝。 |
+| **版本紧急召回** | 召回在**一个事务**内：`UPDATE recipe_version ... WHERE recalled=0` 置召回标志并 `SELECT ... FOR UPDATE` 固化 `版本+截止时刻` 范围内全部订单（唯一键保证一个版本只此一批）。预占事务也锁版本行，故召回提交后**立即阻止新预占**（`VERSION_RECALLED`），截止时刻不会漏入新单。逐单在**独立事务**里按当前状态 CAS：`PREOCCUPIED→RECALLED`（释放原材料）、`COMMITTED→RECALLED`（产出全在则**一次性收回全部产出+返还原始材料**，成对 `RECALL_CLAWBACK`/`RECALL_RETURN` 流水）、产出不足→`COMMITTED→RECALL_EXCEPTION`（**不部分清算**、可重试）；取消/超时/已撤销只记判定不改写历史。 |
+| **召回并发唯一赢家** | 召回清算与玩家完成/取消/超时/运营撤销竞争同一张单：所有路径都先 `SELECT ... FOR UPDATE` 锁订单行再做状态 CAS，READ COMMITTED 下锁等待后读到对方已提交状态，因而**每张单恰有一次状态迁移获胜**，最终恰好归入 RELEASED / REVERSED / SKIPPED / EXCEPTION 之一。 |
+| **召回批次可续跑/幂等** | 批次、逐单快照结果、逐次尝试事件全部持久化；每单独立事务，处理中断或重启后只从 `PENDING` 行续跑，已完成单直接返回原结果。`recall_batch` 上有 `(idempotency_key)` 与 `(recipe_version_id)` 两个唯一键：同幂等键或对同版本重复发起都只返回**原批次**；`ledger` 唯一键 + 订单 CAS 保证不重复返还/扣回。异常单补足库存后可逐单重试，前次挂账记录保留。 |
 
 ### 账本即流水
 
 `player_inventory.qty` 只在事务内被行锁 UPDATE 修改；每次变动在 `ledger_entry` 追加一条带方向的流水：
 
-- `CONSUME`（预占扣减，负）、`PRODUCE`（完成产出，正）、`RELEASE`（取消/超时回补，正）
+- `CONSUME`（预占扣减，负）、`PRODUCE`（完成产出，正）、`RELEASE`（取消/超时/召回预占回补，正）
 - `GRANT`（运营设置）、`REVOKE`（撤销冲销，负）、`REVOKE_PENDING`（撤销挂账，负，status=PENDING）
+- `RECALL_CLAWBACK`（召回收回产出，负）、`RECALL_RETURN`（召回返还原始材料，正）：同一订单共享一个结算单号 `RC…`，与原 `CONSUME`/`PRODUCE` 构成**成对补偿**，`related_ref` 指向原单号
+- `RECALL_PENDING`（召回产出不足挂账，负，status=PENDING）：每次失败尝试留一条带时间的可追溯记录，不改动余额
 
 前端“逐笔材料去向”即按单号聚合这些流水（含时间、类型、关联单号、说明）。
 
@@ -114,13 +120,18 @@ bash scripts/smoke-e2e.sh
 - `GET/POST /recipes`、`POST /recipes/new-version`、`POST /recipes/draft`、`POST /recipes/publish`、`POST /recipes/close`
 - `GET  /crafts`、`GET  /ledger?refNo=`
 - `POST /revokes` `{orderNo}`、`GET /revokes`、`GET /exceptions`
+- `POST /recalls` `{versionId,reason}`（需 `Idempotency-Key`：发起版本紧急召回，返回批次与实时进度）
+- `POST /recalls/{batchNo}/run`（继续/幂等清算）、`POST /recalls/retry` `{batchNo,orderNo}`（补足后重试异常单）
+- `GET  /recalls`、`GET /recalls/{batchNo}`（进度/各结果数量/逐单原因与尝试次数）、`GET /recalls/{batchNo}/orders/{orderNo}/events`、`GET /recall-exceptions?batchNo=`
 - `POST /inventory/grant`（测试/补库存，附 GRANT 审计流水）
 
 公共：`POST /api/auth/login` `{username,password}`
 
 错误形如 `{"error":"MATERIAL_INSUFFICIENT","message":"材料不足：MAT_IRON 需要 3"}`，常见码：
 `RECIPE_CLOSED` / `ACTIVITY_NOT_OPEN` / `RECIPE_NOT_PUBLISHED` / `MATERIAL_INSUFFICIENT` /
-`PREOCCUPY_EXPIRED` / `ORDER_COMMIT_RACE` / `RETRY_IN_FLIGHT` / `ORDER_NOT_REVOKABLE`。
+`PREOCCUPY_EXPIRED` / `ORDER_COMMIT_RACE` / `RETRY_IN_FLIGHT` / `ORDER_NOT_REVOKABLE` /
+`VERSION_RECALLED`（召回后拒绝新预占）/ `VERSION_ALREADY_RECALLED`（对已召回版本重复发起，返回原批次）/
+`RECALL_BATCH_NOT_FOUND` / `ORDER_RECALL_OWNS`（已被批次接管的单不能再单独撤销）。
 
 ---
 
@@ -136,8 +147,8 @@ npm run build      # 产物 dist/
 发布到后端单端口：把 `dist/*` 拷到 `backend/src/main/resources/static/`（已内置一份）。
 
 操作台包含：
-- 玩家：配方版本与**合成预览**（每行材料的需要/持有/其他单占用/缺口）、预占倒计时、背包、**按合成单逐笔材料去向**、最近流水。
-- 运营：配方多版本管理（草稿/发布/归档，已发布只读）、账本监控（按单号查流水）、撤销与**异常清单**、库存工具。
+- 玩家：配方版本与**合成预览**（每行材料的需要/持有/其他单占用/缺口、**召回版本醒目拦截**）、预占倒计时、背包、**按合成单逐笔材料去向**（含召回收回/返还成对流水与中文去向说明）、最近流水。
+- 运营：配方多版本管理（草稿/发布/归档，已发布只读，每版可“紧急召回”）、账本监控（按单号查流水）、撤销与**异常清单**、**版本紧急召回批次台**（发起/进度/各结果数量/逐单原因/尝试次数/可重试异常与一键重试）、库存工具。
 
 ---
 
@@ -153,9 +164,10 @@ backend/
     common/      时钟、错误码、单号生成、JSON
     domain/      值对象
     repo/        JdbcTemplate 仓储（FOR UPDATE / 条件更新 / CAS）
-    service/     CraftTxService(事务核心) CraftService(幂等外观) RecipeAdminService TimeoutSweeper …
+    service/     CraftTxService(事务核心) CraftService(幂等外观) RecipeAdminService TimeoutSweeper
+                 RecallService(批次/幂等/续跑外观) RecallTxService(逐单清算事务) RecallBatchProcessor(重启续跑)
     web/         控制器、鉴权拦截器、全局异常
-  src/test/      H2 并发/版本/超时/撤销/HTTP 全流程 + MySQL Testcontainers IT
+  src/test/      H2 并发/版本/超时/撤销/HTTP 全流程 + 召回批次（含崩溃续跑/并发赢家/异常重试）+ MySQL Testcontainers IT
 frontend/        Vue 3 操作台源码
 deploy/          docker-compose（MySQL）
 scripts/smoke-e2e.sh

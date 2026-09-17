@@ -143,6 +143,9 @@ public class RecipeAdminService {
         m.put("endTime", v.endTime());
         m.put("craftTimeoutSeconds", v.craftTimeoutSeconds());
         m.put("publishedAt", v.publishedAt());
+        m.put("recalled", v.recalled());
+        m.put("recalledAt", v.recalledAt());
+        m.put("recallBatchNo", v.recallBatchNo());
         return m;
     }
 

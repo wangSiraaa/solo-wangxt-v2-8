@@ -74,6 +74,11 @@ public class CraftTxService {
         }
         RecipeVersion version = recipes.findPublishedVersionForUpdate(recipeId)
                 .orElseThrow(() -> ApiException.conflict("RECIPE_NOT_PUBLISHED", "配方无已发布版本"));
+        // Emergency recall: the version row is locked here and flagged; no new preoccupy can land.
+        if (version.recalled()) {
+            throw ApiException.conflict("VERSION_RECALLED",
+                    "配方版本 v" + version.versionNo() + " 已紧急召回，无法开始合成");
+        }
         if (!version.isOpenAt(now)) {
             throw ApiException.conflict("ACTIVITY_NOT_OPEN",
                     "活动未在有效期内（开始 " + version.startTime() + "，结束 " + version.endTime() + "）");
@@ -122,8 +127,11 @@ public class CraftTxService {
             case "COMMITTED" -> {
                 return order; // idempotent terminal state; facade decides replay vs conflict
             }
-            case "CANCELLED", "TIMEOUT", "REVOKED" ->
+            case "CANCELLED", "TIMEOUT", "REVOKED", "RECALLED" ->
                 throw ApiException.conflict("ORDER_NOT_OPEN", "合成单已结束：" + order.status());
+            case "RECALL_EXCEPTION" ->
+                throw ApiException.conflict("ORDER_RECALL_PENDING",
+                        "合成单已被召回，等待清算，无法提交");
             default -> { /* PREOCCUPIED */ }
         }
         if (!order.preoccupyDeadline().isAfter(now)) {
@@ -221,6 +229,12 @@ public class CraftTxService {
         if (!"COMMITTED".equals(order.status())) {
             throw ApiException.conflict("ORDER_NOT_REVOKABLE",
                     "仅已完成的合成可撤销，当前状态：" + order.status());
+        }
+        // A recall batch snapshot that already owns this order wins over a manual revoke:
+        // both paths CAS COMMITTED->..., and the batch marker makes precedence explicit.
+        if (order.recallBatchNo() != null) {
+            throw ApiException.conflict("ORDER_RECALL_OWNS",
+                    "该合成单已被召回批次 " + order.recallBatchNo() + " 接管，不能再单独撤销");
         }
         List<LedgerEntry> produces = ledger.findProducesByOrderNo(orderNo);
         if (produces.isEmpty()) {

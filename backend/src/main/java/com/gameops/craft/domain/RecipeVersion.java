@@ -14,7 +14,10 @@ public record RecipeVersion(
         Instant startTime,
         Instant endTime,
         int craftTimeoutSeconds,
-        Instant publishedAt
+        Instant publishedAt,
+        boolean recalled,
+        Instant recalledAt,
+        String recallBatchNo
 ) {
     public boolean isOpenAt(Instant now) {
         if (startTime != null && now.isBefore(startTime())) {

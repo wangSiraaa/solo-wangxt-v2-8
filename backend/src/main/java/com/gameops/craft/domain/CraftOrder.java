@@ -17,5 +17,7 @@ public record CraftOrder(
         Instant committedAt,
         Instant closedAt,
         String revokeRefNo,
+        String recallBatchNo,
+        Instant recallSettledAt,
         Instant createdAt
 ) {}
